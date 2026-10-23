@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Antes de cada commit: el guardián revisa que no se cuele nada privado.
+exec "$(git rev-parse --show-toplevel)/herramientas/guardian.sh"

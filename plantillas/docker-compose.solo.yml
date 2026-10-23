@@ -1,0 +1,153 @@
+# OpenReply en un servidor vacio (por ejemplo, un VPS con Docker).
+#
+# Caddy pone el candado https solo, con tu dominio. Todo lo tuyo va en el
+# archivo .env (copia de plantillas/env.example): aqui no se escribe nada
+# personal, y si falta un dato obligatorio Docker se para y te dice cual.
+#
+# Si en tu servidor ya hay un Traefik (por ejemplo, la plantilla de n8n de
+# Hostinger), usa docker-compose.traefik.yml en vez de este.
+
+x-app-env: &app-env
+  NODE_ENV: production
+  NEXTAUTH_URL: https://${DOMINIO:?Falta DOMINIO en el .env}
+  NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:?Falta NEXTAUTH_SECRET en el .env}
+  CRON_SECRET: ${CRON_SECRET:?Falta CRON_SECRET en el .env}
+  ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Falta ENCRYPTION_KEY en el .env}
+  DATABASE_URL: postgresql://openreply:${POSTGRES_PASSWORD:?Falta POSTGRES_PASSWORD en el .env}@openreply-db:5432/openreply
+  REDIS_URL: redis://openreply-redis:6379
+  # Correo de los enlaces de acceso: EMAIL_SERVER (tu buzon) o RESEND_API_KEY.
+  EMAIL_SERVER: ${EMAIL_SERVER:-}
+  RESEND_API_KEY: ${RESEND_API_KEY:-}
+  EMAIL_FROM: ${EMAIL_FROM:?Falta EMAIL_FROM en el .env}
+  # Sin esto, cualquiera que llegue a tu panel se crea su propio espacio.
+  ALLOWED_EMAILS: ${ALLOWED_EMAILS:?Falta ALLOWED_EMAILS en el .env}
+  META_GRAPH_API_VERSION: ${META_GRAPH_API_VERSION:-v25.0}
+  INSTAGRAM_APP_ID: ${INSTAGRAM_APP_ID:-}
+  INSTAGRAM_APP_SECRET: ${INSTAGRAM_APP_SECRET:-}
+  FACEBOOK_APP_SECRET: ${FACEBOOK_APP_SECRET:-}
+  WEBHOOK_VERIFY_TOKEN: ${WEBHOOK_VERIFY_TOKEN:?Falta WEBHOOK_VERIFY_TOKEN en el .env}
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  openreply-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    mem_limit: 256m
+    environment:
+      POSTGRES_DB: openreply
+      POSTGRES_USER: openreply
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Falta POSTGRES_PASSWORD en el .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U openreply -d openreply"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [internal]
+    logging: *logging
+
+  openreply-redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    mem_limit: 128m
+    # La cola de mensajes pierde trabajos si Redis borra claves: noeviction.
+    command: ["redis-server", "--maxmemory", "96mb", "--maxmemory-policy", "noeviction", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [internal]
+    logging: *logging
+
+  openreply-web:
+    # La imagen que construye tu GitHub (ver plantillas/publicar-imagen.yml).
+    image: ${OPENREPLY_IMAGE:?Falta OPENREPLY_IMAGE en el .env}
+    restart: unless-stopped
+    mem_limit: 640m
+    # Las migraciones van al arrancar: en el build la base de datos no existe.
+    # Binarios directos y no `npm run`: npm se queda en memoria (~50 MB) y no
+    # reenvia bien la orden de parar.
+    command: ["sh", "-c", "node_modules/.bin/prisma migrate deploy && exec node_modules/.bin/next start"]
+    environment:
+      <<: *app-env
+      NODE_OPTIONS: --max-old-space-size=448
+    depends_on:
+      openreply-db:
+        condition: service_healthy
+      openreply-redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3000/login || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    networks: [internal]
+    logging: *logging
+
+  openreply-worker:
+    image: ${OPENREPLY_IMAGE:?Falta OPENREPLY_IMAGE en el .env}
+    restart: unless-stopped
+    # tsx compila el TypeScript al arrancar: con 384 MB se quedaba corto.
+    mem_limit: 512m
+    command: ["node_modules/.bin/tsx", "worker/dm-worker.ts"]
+    environment:
+      <<: *app-env
+      NODE_OPTIONS: --max-old-space-size=320
+    depends_on:
+      openreply-web:
+        condition: service_healthy
+    networks: [internal]
+    logging: *logging
+
+  # Sin esto el permiso de Instagram caduca en silencio y las campanas de
+  # "proxima publicacion" no se enganchan nunca.
+  openreply-cron:
+    image: ${OPENREPLY_IMAGE:?Falta OPENREPLY_IMAGE en el .env}
+    restart: unless-stopped
+    mem_limit: 64m
+    command: ["sh", "scripts/cron.sh"]
+    environment:
+      CRON_BASE_URL: http://openreply-web:3000
+      CRON_SECRET: ${CRON_SECRET:?Falta CRON_SECRET en el .env}
+    depends_on:
+      openreply-web:
+        condition: service_healthy
+    networks: [internal]
+    logging: *logging
+
+  # La puerta de entrada: https automatico con tu dominio.
+  caddy:
+    image: caddy:2.8.4-alpine
+    restart: unless-stopped
+    mem_limit: 64m
+    command: ["caddy", "reverse-proxy", "--from", "${DOMINIO:?Falta DOMINIO en el .env}", "--to", "openreply-web:3000"]
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      openreply-web:
+        condition: service_healthy
+    networks: [internal]
+    logging: *logging
+
+volumes:
+  pgdata:
+  redisdata:
+  caddy-data:
+  caddy-config:
+
+networks:
+  internal: {}

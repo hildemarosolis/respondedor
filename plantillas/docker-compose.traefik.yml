@@ -1,0 +1,134 @@
+# OpenReply en un servidor que YA tiene Traefik delante de otra cosa (por
+# ejemplo, la plantilla de n8n de Hostinger). OpenReply se une a la red de ese
+# Traefik y Traefik lo publica con tu dominio. El otro proyecto no se toca.
+#
+# Los valores por defecto de TRAEFIK_* son los de la plantilla de n8n de
+# Hostinger. Si tu Traefik es otro, cambialos en el .env.
+#
+# Si tu servidor esta vacio, usa docker-compose.solo.yml en vez de este.
+
+x-app-env: &app-env
+  NODE_ENV: production
+  NEXTAUTH_URL: https://${DOMINIO:?Falta DOMINIO en el .env}
+  NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:?Falta NEXTAUTH_SECRET en el .env}
+  CRON_SECRET: ${CRON_SECRET:?Falta CRON_SECRET en el .env}
+  ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Falta ENCRYPTION_KEY en el .env}
+  DATABASE_URL: postgresql://openreply:${POSTGRES_PASSWORD:?Falta POSTGRES_PASSWORD en el .env}@openreply-db:5432/openreply
+  REDIS_URL: redis://openreply-redis:6379
+  EMAIL_SERVER: ${EMAIL_SERVER:-}
+  RESEND_API_KEY: ${RESEND_API_KEY:-}
+  EMAIL_FROM: ${EMAIL_FROM:?Falta EMAIL_FROM en el .env}
+  ALLOWED_EMAILS: ${ALLOWED_EMAILS:?Falta ALLOWED_EMAILS en el .env}
+  META_GRAPH_API_VERSION: ${META_GRAPH_API_VERSION:-v25.0}
+  INSTAGRAM_APP_ID: ${INSTAGRAM_APP_ID:-}
+  INSTAGRAM_APP_SECRET: ${INSTAGRAM_APP_SECRET:-}
+  FACEBOOK_APP_SECRET: ${FACEBOOK_APP_SECRET:-}
+  WEBHOOK_VERIFY_TOKEN: ${WEBHOOK_VERIFY_TOKEN:?Falta WEBHOOK_VERIFY_TOKEN en el .env}
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  openreply-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    mem_limit: 256m
+    environment:
+      POSTGRES_DB: openreply
+      POSTGRES_USER: openreply
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Falta POSTGRES_PASSWORD en el .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U openreply -d openreply"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [internal]
+    logging: *logging
+
+  openreply-redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    mem_limit: 128m
+    command: ["redis-server", "--maxmemory", "96mb", "--maxmemory-policy", "noeviction", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [internal]
+    logging: *logging
+
+  openreply-web:
+    image: ${OPENREPLY_IMAGE:?Falta OPENREPLY_IMAGE en el .env}
+    restart: unless-stopped
+    mem_limit: 640m
+    command: ["sh", "-c", "node_modules/.bin/prisma migrate deploy && exec node_modules/.bin/next start"]
+    environment:
+      <<: *app-env
+      NODE_OPTIONS: --max-old-space-size=448
+    depends_on:
+      openreply-db:
+        condition: service_healthy
+      openreply-redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3000/login || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=${TRAEFIK_RED:-n8n_default}
+      - traefik.http.routers.openreply.rule=Host(`${DOMINIO:?Falta DOMINIO en el .env}`)
+      - traefik.http.routers.openreply.entrypoints=${TRAEFIK_ENTRADA:-websecure}
+      - traefik.http.routers.openreply.tls=true
+      - traefik.http.routers.openreply.tls.certresolver=${TRAEFIK_CERTIFICADOS:-mytlschallenge}
+      - traefik.http.services.openreply.loadbalancer.server.port=3000
+    networks: [internal, proxy]
+    logging: *logging
+
+  openreply-worker:
+    image: ${OPENREPLY_IMAGE:?Falta OPENREPLY_IMAGE en el .env}
+    restart: unless-stopped
+    mem_limit: 512m
+    command: ["node_modules/.bin/tsx", "worker/dm-worker.ts"]
+    environment:
+      <<: *app-env
+      NODE_OPTIONS: --max-old-space-size=320
+    depends_on:
+      openreply-web:
+        condition: service_healthy
+    networks: [internal]
+    logging: *logging
+
+  openreply-cron:
+    image: ${OPENREPLY_IMAGE:?Falta OPENREPLY_IMAGE en el .env}
+    restart: unless-stopped
+    mem_limit: 64m
+    command: ["sh", "scripts/cron.sh"]
+    environment:
+      CRON_BASE_URL: http://openreply-web:3000
+      CRON_SECRET: ${CRON_SECRET:?Falta CRON_SECRET en el .env}
+    depends_on:
+      openreply-web:
+        condition: service_healthy
+    networks: [internal]
+    logging: *logging
+
+volumes:
+  pgdata:
+  redisdata:
+
+networks:
+  internal: {}
+  proxy:
+    name: ${TRAEFIK_RED:-n8n_default}
+    external: true

@@ -1,0 +1,6 @@
+# Claves: nunca al repo
+.env
+*.env
+!plantillas/env.example
+.DS_Store
+__pycache__/

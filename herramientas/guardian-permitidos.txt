@@ -1,0 +1,3 @@
+# Datos que este repo publica A PROPOSITO. El guardian no los marca.
+# Contacto del servicio de instalacion
+hola@visioncoder.app

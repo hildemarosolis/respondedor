@@ -1,0 +1,18 @@
+name: Guardián anti-fuga
+
+# Segunda barrera, por si alguien sube sin el hook local: revisa cada push.
+# Aquí solo están los patrones genéricos; la lista privada vive fuera del repo.
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  guardian:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash herramientas/guardian.sh
